@@ -84,12 +84,15 @@ var (
 	chars = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$^&*(){}][:<>.")
 
 	// Counters / misc.
-	signals        = make(chan os.Signal)
-	killClients    = make(chan bool, 24)
-	sentCntr       = make(chan int64, 1)
-	latency        []float64
-	latencies      = make(chan float64, 1)
-	resetLatencies = make(chan bool, 1)
+	signals                = make(chan os.Signal)
+	killClients            = make(chan bool, 24)
+	sentCntr               = make(chan int64, 1)
+	latency                []float64
+	encodingLatency        []float64
+	latencies              = make(chan float64, 1)
+	encodingLatencies      = make(chan float64, 1)
+	resetLatencies         = make(chan bool, 1)
+	resetEncodingLatencies = make(chan bool, 1)
 )
 
 func init() {
@@ -202,9 +205,12 @@ func clientProducer(c kafka.Client) {
 				}
 			}
 
+			startEncode := time.Now()
 			msgData, err := recordToAvroEncodedMessage(record)
 			if err != nil {
 				continue
+			} else {
+				encodingLatencies <- time.Since(startEncode).Seconds() * 1000
 			}
 
 			msg := &kafka.ProducerMessage{Topic: topic, Value: kafka.ByteEncoder(msgData)}
@@ -435,6 +441,17 @@ func latencyAggregator() {
 	}
 }
 
+func encodingLatencyAggregator() {
+	for {
+		select {
+		case j := <-encodingLatencies:
+			encodingLatency = append(encodingLatency, j)
+		case <-resetEncodingLatencies:
+			encodingLatency = encodingLatency[:0]
+		}
+	}
+}
+
 // Calculates aggregate raw message output in networking friendly units.
 // Gives an idea of minimum network traffic being generated.
 func calcOutput(n int64) (float64, string) {
@@ -476,11 +493,37 @@ func calcLatency() float64 {
 	return avg
 }
 
+func calcEncodingLatency() float64 {
+	var avg float64
+	// With 'noop', we don't have latencies to operate on.
+	switch noop {
+	case true:
+		break
+	default:
+		// Fetch values.
+		lat := encodingLatency
+		// Issue the current values to be cleared.
+		resetEncodingLatencies <- true
+		// Sort and sum values.
+		sort.Float64s(lat)
+		var sum float64
+		// Get percentile count and values, sum values.
+		topn := int(float64(len(lat)) * 0.90)
+		for i := topn; i < len(lat); i++ {
+			sum += lat[i]
+		}
+		// Calc average.
+		avg = sum / float64(len(lat)-topn)
+	}
+	return avg
+}
+
 func main() {
 	// Listens for signals.
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	// Fire up misc. tasks.
 	go latencyAggregator()
+	go encodingLatencyAggregator()
 	if graphiteIp != "" {
 		go graphiteWriter()
 	}
@@ -523,6 +566,7 @@ func main() {
 			// Update the metrics map which is also passed to the Graphite writer.
 			metrics["rate"] = float64(deltaCnt / 5)
 			metrics["90th"] = calcLatency() // Well, this technically appends a small latency to the 5s interval.
+			metrics["90th-enc"] = calcEncodingLatency()
 			metrics["output"] = outputBytes
 			now := time.Now()
 			ts := float64(now.Unix())
@@ -531,11 +575,12 @@ func main() {
 				metricsOutgoing <- metrics
 			}
 
-			log.Printf("Generating %s @ %.0f messages/sec | topic: %s | %.2fms 90%%ile latency\n",
+			log.Printf("Generating %s @ %.0f messages/sec | topic: %s | %.2fms 90%%ile latency | %.2fms 90%%ile encoding latency\n",
 				outputString,
 				metrics["rate"],
 				topic,
-				metrics["90th"])
+				metrics["90th"],
+				metrics["90th-enc"])
 
 		// Waits for signals. Currently just brutally kills Sangrenel.
 		case <-signals:
