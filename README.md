@@ -3,6 +3,8 @@ sangrenel
 
 "...basically a cloth bag filled with small jagged pieces of scrap iron"
 
+**Modified to benchmark a custom scenario which involves NYC taxi trip events.**
+
 ### Installation
 NOTE: Sangrenel has a dependency on Shopify's Sarama Kafka client, which tends to change often. Subsequently, I have moved to managing this dependency as a local copy in the Sangrenel repo in accordance with the officially recommended Golang [guidance](http://golang.org/doc/faq#get_version).
 
@@ -47,7 +49,7 @@ Sangrenel outputs metrics based on the previous 5 seconds of operation: the aggr
 If optionally defined, Graphite can be used as a secondary output location. This allows you to graph performance results in addition to overlaying Sangrenel metrics against Kafka cluster metrics that you may already be collecting in Graphite.
 
 <pre>
-% ./sangrenel -brokers="192.168.100.204:9092" -size=250 -topic=load -clients=4 -graphite-ip="192.168.100.175" -graphite-port="2013" 
+% ./sangrenel -brokers="192.168.100.204:9092" -size=250 -topic=load -clients=4 -graphite-ip="192.168.100.175" -graphite-port="2013"
 
 ::: Sangrenel :::
 
