@@ -22,8 +22,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -36,10 +40,34 @@ import (
 	"time"
 
 	kafka "github.com/milinda/sangrenel/vendor/github.com/Shopify/sarama"
+	avro "github.com/stealthly/go-avro"
 )
+
+var tripSchema = `{
+     "type": "record",
+     "namespace": "org.pathirage.samzasql",
+     "name": "TaxiTrip",
+     "fields": [
+       { "name": "medallion", "type": ["null", "string"], "default": null },
+       { "name": "hack_license", "type": ["null", "string"], "default": null },
+       { "name": "vendor_id", "type": ["null", "string"], "default": null },
+       { "name": "rate_code", "type": ["null", "int"], "default": null },
+       { "name": "store_and_fwd_flag", "type": ["null", "string"], "default": null },
+       { "name": "pickup_datetime", "type": ["null", "long"], "default": null },
+       { "name": "dropoff_datetime", "type": ["null", "long"], "default": null },
+       { "name": "passenger_count", "type": ["null", "int"], "default": null },
+       { "name": "trip_time_in_secs", "type": ["null", "int"], "default": null },
+       { "name": "trip_distance", "type": ["null", "float"], "default": null },
+       { "name": "pickup_longitude", "type": ["null", "float"], "default": null },
+       { "name": "pickup_latitude", "type": ["null", "float"], "default": null },
+       { "name": "dropoff_longitude", "type": ["null", "float"], "default": null },
+       { "name": "dropoff_latitude", "type": ["null", "float"], "default": null }
+     ]
+}`
 
 var (
 	// Configs.
+	dataFiles      = make(chan string, 100)
 	brokers        []string
 	topic          string
 	msgSize        int64
@@ -50,32 +78,42 @@ var (
 	clients        int
 	producers      int
 	noop           bool
+	schema         avro.Schema
 
 	// Character selection from which random messages are generated.
 	chars = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$^&*(){}][:<>.")
 
 	// Counters / misc.
 	signals        = make(chan os.Signal)
-	killClients = make(chan bool, 24)
-	sentCntr        = make(chan int64, 1)
-	latency         []float64
-	latencies    = make(chan float64, 1)
-	resetLatencies   = make(chan bool, 1)
+	killClients    = make(chan bool, 24)
+	sentCntr       = make(chan int64, 1)
+	latency        []float64
+	latencies      = make(chan float64, 1)
+	resetLatencies = make(chan bool, 1)
 )
 
 func init() {
 	flag.StringVar(&topic, "topic", "sangrenel", "Topic to publish to")
-	flag.Int64Var(&msgSize, "size", 300, "Message size in bytes")
+	flag.Int64Var(&msgSize, "size", 104, "Message size in bytes")
 	flag.Int64Var(&msgRate, "rate", 100000000, "Apply a global message rate limit")
 	flag.IntVar(&batchSize, "batch", 0, "Max messages per batch. Defaults to unlimited (0).")
 	flag.StringVar(&compressionOpt, "compression", "none", "Message compression: none, gzip, snappy")
 	flag.BoolVar(&noop, "noop", false, "Test message generation performance, do not transmit messages")
-	flag.IntVar(&clients, "clients", 1, "Number of Kafka client workers")
+	flag.IntVar(&clients, "clients", 2, "Number of Kafka client workers")
 	flag.IntVar(&producers, "producers", 5, "Number of producer instances per client")
 	brokerString := flag.String("brokers", "localhost:9092", "Comma delimited list of Kafka brokers")
+	dataFilesString := flag.String("data", "Part1", "Comma delimited list of csv files containing trip events")
 	flag.Parse()
 
 	brokers = strings.Split(*brokerString, ",")
+
+	for _, broker := range brokers {
+		log.Println(fmt.Sprintf("broker: %s", broker))
+	}
+
+	for _, file := range strings.Split(*dataFilesString, ",") {
+		dataFiles <- file
+	}
 
 	switch compressionOpt {
 	case "gzip":
@@ -89,6 +127,8 @@ func init() {
 		os.Exit(1)
 	}
 
+	schema = avro.MustParseSchema(tripSchema)
+
 	sentCntr <- 0
 	runtime.GOMAXPROCS(runtime.NumCPU())
 }
@@ -97,6 +137,8 @@ func init() {
 // Workers track and limit message rates using incrSent() and fetchSent().
 // Default 5 instances of clientProducer are created under each Kafka client.
 func clientProducer(c kafka.Client) {
+	var csvFilePath string
+	var csvFile *os.File
 	producer, err := kafka.NewSyncProducerFromClient(c)
 	if err != nil {
 		log.Println(err.Error())
@@ -104,9 +146,25 @@ func clientProducer(c kafka.Client) {
 	defer producer.Close()
 
 	// Instantiate rand per producer to avoid mutex contention.
-	source := rand.NewSource(time.Now().UnixNano())
-	generator := rand.New(source)
-	msgData := make([]byte, msgSize)
+	//source := rand.NewSource(time.Now().UnixNano())
+	//generator := rand.New(source)
+	//msgData := make([]byte, msgSize)
+
+	// Get a CSV file from dataFiles
+	select {
+	case csvFilePath = <-dataFiles:
+	default:
+		log.Println("No data files available!")
+		return
+	}
+
+	csvFile, err = os.Open(csvFilePath)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer csvFile.Close()
+	csvReader := csv.NewReader(csvFile)
 
 	// Use a local accumulator then periodically update global counter.
 	// Global counter can become a bottleneck with too many threads.
@@ -122,7 +180,33 @@ func clientProducer(c kafka.Client) {
 		countStart := fetchSent()
 		var start time.Time
 		for fetchSent()-countStart < msgRate {
-			randMsg(msgData, *generator)
+			//randMsg(msgData, *generator)
+
+			// Retrieve a record from CSV file
+			record, err := csvReader.Read()
+			if err != nil {
+				if err == io.EOF {
+					select {
+					case csvFilePath = <-dataFiles:
+					default:
+						log.Println("No data files available!")
+						return
+					}
+					csvFile, err := os.Open(csvFilePath)
+					if err != nil {
+						log.Println(err)
+						return
+					}
+					defer csvFile.Close()
+					csvReader = csv.NewReader(csvFile)
+				}
+			}
+
+			msgData, err := recordToAvroEncodedMessage(record)
+			if err != nil {
+				continue
+			}
+
 			msg := &kafka.ProducerMessage{Topic: topic, Value: kafka.ByteEncoder(msgData)}
 			// We start timing after the message is created.
 			// This ensures latency metering from the time between message sent and receiving an ack.
@@ -147,6 +231,118 @@ func clientProducer(c kafka.Client) {
 		// the inner loop breaks and the outer loop sleeps for the second remainder.
 		time.Sleep(rateEnd.Sub(time.Now()) + time.Since(start))
 	}
+}
+
+func recordToAvroEncodedMessage(record []string) ([]byte, error) {
+
+	if len(record) == 0 || len(record) < 14 {
+		return nil, errors.New(fmt.Sprintf("Invalid record length %d", len(record)))
+	}
+
+	avroRecord := avro.NewGenericRecord(schema)
+
+	avroRecord.Set("medallion", record[0])
+	avroRecord.Set("hack_license", record[1])
+	avroRecord.Set("vendor_id", record[2])
+
+	rateCode, err := strconv.ParseInt(record[3], 10, 32)
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("rate_code", rateCode)
+	}
+
+	avroRecord.Set("store_and_fwd_flag", record[4])
+
+	pickupTime, err := dateTimeStringToUnix(record[5])
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("pickup_datetime", pickupTime)
+	}
+
+	dropOffTime, err := dateTimeStringToUnix(record[6])
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("dropoff_datetime", dropOffTime)
+	}
+
+	passengerCode, err := strconv.ParseInt(record[7], 10, 32)
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("passenger_count", passengerCode)
+	}
+
+	tripTime, err := strconv.ParseInt(record[8], 10, 32)
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("trip_time_in_secs", tripTime)
+	}
+
+	tripDistance, err := strconv.ParseFloat(record[9], 32)
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("trip_distance", tripDistance)
+	}
+
+	pickupLong, err := strconv.ParseFloat(record[10], 32)
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("pickup_longitude", pickupLong)
+	}
+
+	pickupLat, err := strconv.ParseFloat(record[11], 32)
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("pickup_latitude", pickupLat)
+	}
+
+	dropLong, err := strconv.ParseFloat(record[12], 32)
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("dropoff_longitude", dropLong)
+	}
+
+	dropLat, err := strconv.ParseFloat(record[13], 32)
+	if err != nil {
+		log.Println(err)
+	} else {
+		avroRecord.Set("dropoff_latitude", dropLat)
+	}
+
+	writer := avro.NewGenericDatumWriter()
+	// SetSchema must be called before calling Write
+	writer.SetSchema(schema)
+
+	// Create a new Buffer and Encoder to write to this Buffer
+	buffer := new(bytes.Buffer)
+	encoder := avro.NewBinaryEncoder(buffer)
+
+	// Write the record
+	err = writer.Write(avroRecord, encoder)
+	if err != nil {
+		panic(err)
+	}
+
+	return buffer.Bytes(), nil
+}
+
+func dateTimeStringToUnix(dateStr string) (int64, error) {
+	timeFormat := "2006-01-02 15:04:05"
+	t, err := time.Parse(timeFormat, dateStr)
+
+	if err != nil {
+		return -1, err
+	}
+
+	return t.Unix(), nil
 }
 
 // clientDummyProducer is a dummy function that kafkaClient calls if noop is True.
@@ -325,7 +521,7 @@ func main() {
 			outputBytes, outputString := calcOutput(deltaCnt)
 
 			// Update the metrics map which is also passed to the Graphite writer.
-			metrics["rate"] = float64(deltaCnt/5)
+			metrics["rate"] = float64(deltaCnt / 5)
 			metrics["90th"] = calcLatency() // Well, this technically appends a small latency to the 5s interval.
 			metrics["output"] = outputBytes
 			now := time.Now()
